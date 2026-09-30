@@ -3,7 +3,7 @@
 **Stop picking models by hand. Let the router pick the cheapest one that can do the job.**
 
 One local endpoint for OpenCode (or any OpenAI-compatible client). Typos go to a fast, cheap model.
-Deadlock hunts go to a heavyweight. You never touch the model picker.
+Deadlock hunts go to a heavyweight. Out of quota on one provider? It switches to another. You never touch the model picker.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Rust](https://img.shields.io/badge/rust-2024-orange.svg)
@@ -19,6 +19,7 @@ Deadlock hunts go to a heavyweight. You never touch the model picker.
 - **Cut your bill.** Stop paying frontier prices for one-line edits.
 - **Stay fast.** Simple asks get quick models.
 - **Never get stuck.** Provider down, rate-limited, or 5xx? The router falls back automatically, same tier first, then higher.
+- **Limit-proof.** Hit your Claude, OpenAI or Mistral rate limit or quota? The router detects it, honours `Retry-After`, sidelines the model (or the whole provider when credits run out) and keeps working on the next best one.
 - **One endpoint, every provider.** Claude, OpenAI, Mistral, Ollama, llama.cpp, OpenRouter... anything OpenAI-compatible.
 - **Predictable.** An AI classifier only emits *signals*. A pure, deterministic, unit-tested policy makes the actual decision.
 - **Stable.** Hysteresis avoids flip-flopping models between messages; tool loops keep their model.
