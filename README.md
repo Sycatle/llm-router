@@ -1,47 +1,41 @@
 # llm-router
 
-Local router for OpenCode (or any OpenAI-compatible client). It exposes one OpenAI-compatible endpoint and
-relays to **Anthropic (Claude)**, **OpenAI**, **Mistral** and any OpenAI-compatible server (Ollama, llama.cpp,
-OpenRouter...). A classifier (Jev) emits structured signals, a deterministic policy picks the tier, then the model.
+**Stop picking models by hand. Let the router pick the cheapest one that can do the job.**
 
-```
-OpenCode --> POST /v1/chat/completions   (model = auto | auto-fast | auto-standard | auto-reasoning
-                |                                 | auto-frontier | <provider/model> = forced)
-                v
-          api/openai_compat            session id = x-session-id header (OpenCode sends it)
-                v
-          router::RouterService  -- tool-loop continuation? keep tier, skip classification
-                |
-                +--> RouterClassifier (trait) -- JevClassifier -- POST api.typesafe.ai/v1/systemone
-                |        signals only (task_type, complexity, reasoning, tool_intensity,
-                |        latency_sensitivity, ambiguity, confidence); error => neutral, confidence 0
-                v
-          router::policy (pure)  score -> tier -> hysteresis -> ordered candidates
-                |        filters: context window, tools; degraded models last; escalates to higher tiers
-                v
-          LlmProvider (trait) --+-- anthropic  (Messages API <-> OpenAI translation, SSE)
-                                +-- openai     (pass-through: OpenAI, Mistral, Ollama, OpenRouter... any compatible API)
-                v
-          metrics: SQLite decisions + in-memory cooldown/latency  -->  GET /debug/routes
-```
+One local endpoint for OpenCode (or any OpenAI-compatible client). Typos go to a fast, cheap model.
+Deadlock hunts go to a heavyweight. You never touch the model picker.
 
-## Run
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![Rust](https://img.shields.io/badge/rust-2024-orange.svg)
+
+| You type | Router picks | Why |
+|---|---|---|
+| "fix this typo" | **FAST** (e.g. Haiku) | trivial, low latency matters |
+| "add pagination to this endpoint" | **STANDARD** (e.g. Sonnet) | routine feature work |
+| "find the intermittent deadlock in our async code" | **REASONING / FRONTIER** | subtle, multi-file, high ambiguity |
+
+## Why
+
+- **Cut your bill.** Stop paying frontier prices for one-line edits.
+- **Stay fast.** Simple asks get quick models.
+- **Never get stuck.** Provider down, rate-limited, or 5xx? The router falls back automatically, same tier first, then higher.
+- **One endpoint, every provider.** Claude, OpenAI, Mistral, Ollama, llama.cpp, OpenRouter... anything OpenAI-compatible.
+- **Predictable.** An AI classifier only emits *signals*. A pure, deterministic, unit-tested policy makes the actual decision.
+- **Stable.** Hysteresis avoids flip-flopping models between messages; tool loops keep their model.
+- **Inspectable.** Every decision is logged and served at `GET /debug/routes`.
+
+## Quick start
 
 ```sh
-export ANTHROPIC_API_KEY=...       # Claude
-export TYPESAFE_API_KEY=...        # Jev; without it everything is routed to STANDARD
-export OPENAI_API_KEY=... MISTRAL_API_KEY=...   # optional; a provider without credentials is skipped
-cargo run                          # reads ./router.toml (or: cargo run -- path/to/router.toml)
-RUST_LOG=debug cargo run           # also logs the request headers
+export ANTHROPIC_API_KEY=...        # Claude
+export TYPESAFE_API_KEY=...         # Jev classifier (without it, everything goes to STANDARD)
+export OPENAI_API_KEY=...           # optional
+export MISTRAL_API_KEY=...          # optional; providers without a key are skipped
+
+cargo run                           # reads ./router.toml
 ```
 
-Edit `router.toml` first: model ids and prices are examples. Anthropic reads `ANTHROPIC_API_KEY`.
-Optional and off by default: `auth = "oauth_opencode"` on the Anthropic provider reuses the Claude subscription
-token saved by `opencode /connect` (read-only, no refresh). **Warning:** Anthropic's terms may prohibit using
-subscription tokens outside their own clients, and it sends a Claude Code system prefix. In testing, small requests
-passed but OpenCode-sized ones were rejected (HTTP 400 "out of extra usage"). Use at your own risk.
-
-## OpenCode config (`opencode.json`)
+Edit `router.toml` first: model ids and prices are examples. Then point OpenCode at it:
 
 ```json
 {
@@ -63,66 +57,104 @@ passed but OpenCode-sized ones were rejected (HTTP 400 "out of extra usage"). Us
 }
 ```
 
-Then `/models` -> `LLM Router / Auto`. Modes: `auto`, `auto-<tier>` (forced tier), or any catalog id such as
-`anthropic/opus` (FORCE_MODEL, no fallback; add it to `models` above). Header `x-router-min-tier: reasoning`
-forces a tier floor. Responses carry `x-router-model`, `x-router-tier`, `x-router-request-id`.
+Then `/models` and choose **LLM Router / Auto**. That's it.
 
-## Policy
+## Modes
 
-`score = 0.40 reasoning + 0.30 complexity + 0.15 tool_intensity + 0.15 ambiguity`, plus task-type bias
-(architecture +0.10, debugging/refactor +0.05, simple tasks -0.05), context bias (large +0.05, huge +0.15),
-minus `0.10 latency_sensitivity`. Bands from `routing.thresholds`.
+| `model` value | Behavior |
+|---|---|
+| `auto` | Full routing |
+| `auto-fast` / `auto-standard` / `auto-reasoning` / `auto-frontier` | Force a tier (fallback still applies) |
+| `anthropic/opus` (any catalog id) | Force one model, no fallback (add it to `models` in `opencode.json`) |
 
-- Hysteresis: a new session takes the target tier. In an existing one the score must be `stickiness` outside the
-  current band to switch, `switch_threshold` if the target tier was already used in the last 3 requests (no FAST->STANDARD->FAST).
-- Confidence below `min_confidence` (Jev down, no key): keep the current tier, or STANDARD.
-- Within a tier the current model, then the current provider, is preferred. Tool-loop continuations keep model and tier.
-- Fallback order: same tier, then higher tiers, models in cooldown (429/5xx/network/auth: 30-60s, exponential) last.
-  Fallback is only possible before the first streamed byte.
+Header `x-router-min-tier: reasoning` sets a tier floor. Responses include `x-router-model`, `x-router-tier` and `x-router-request-id`.
 
-## Example decision logs (`RUST_LOG=info`, also stored in `router.db`)
+## How it works
 
 ```
-route: routed request_id=req-f6ae0740e4ea session_id=ses_f0bd24975ffe... task_type=Some("Other") previous_model=None
-  tier=standard model=Some("local/m") reason=low confidence: default standard latency_ms=Some(2) tokens_in=Some(10)
-  tokens_out=Some(4) cost=Some(0.0) success=true error=None fallback=false jev={"confidence":0.0,...}
-route: routed ... previous_model=Some("local/m") tier=standard reason=tool-loop continuation: keep tier ...
+OpenCode --> POST /v1/chat/completions
+                |
+                v
+         Router service ---- tool-loop continuation? keep tier, skip classification
+                |
+                +--> Classifier (trait) -- Jev (TypeSafe System One)
+                |       signals only: task_type, complexity, reasoning, tool_intensity,
+                |       latency_sensitivity, ambiguity, confidence
+                |       failure => neutral signals, confidence 0
+                v
+         Policy engine (pure, deterministic)
+                |       score -> tier -> hysteresis -> ordered candidates
+                |       filters context window + tool support, demotes unhealthy models
+                v
+         Provider (trait) --+-- anthropic  (Messages API <-> OpenAI translation, SSE)
+                            +-- openai     (pass-through: OpenAI, Mistral, Ollama, OpenRouter...)
+                |
+                v
+         Metrics: SQLite decision log + cooldown/latency  -->  GET /debug/routes
 ```
 
-With Jev, `reason` reads e.g. `score 0.77 is 0.22 outside standard (margin 0.15): switch` and `jev` holds the scores.
+### Policy
+
+`score = 0.40 reasoning + 0.30 complexity + 0.15 tool_intensity + 0.15 ambiguity`, adjusted by task type
+(architecture +0.10, debugging/refactor +0.05, simple tasks -0.05), context size (large +0.05, huge +0.15) and
+`-0.10 latency_sensitivity`. Tier bands come from `routing.thresholds`.
+
+- **Hysteresis.** A new session takes the target tier. In an existing one the score must leave the current band by
+  `stickiness` to switch, or by `switch_threshold` if that tier was used in the last 3 requests (no FAST, STANDARD, FAST).
+- **Low confidence** (Jev down or no key): keep the current tier, or STANDARD.
+- **Stickiness.** Within a tier the current model, then the current provider, wins. Tool loops keep model and tier.
+- **Fallback.** Same tier, then higher tiers. Models in cooldown (429/5xx/network/auth, 30-60s, exponential) go last.
+  Only possible before the first streamed byte.
+
+### Example log
+
+```
+route: routed request_id=req-f6ae0740e4ea session_id=ses_f0bd... task_type=Some("Other") previous_model=None
+  tier=standard model=Some("local/m") reason=low confidence: default standard latency_ms=Some(2)
+  tokens_in=Some(10) tokens_out=Some(4) cost=Some(0.0) success=true fallback=false jev={...}
+```
+
+With Jev, `reason` reads like `score 0.77 is 0.22 outside standard (margin 0.15): switch`.
 `curl localhost:8787/debug/routes?limit=20` returns the same records as JSON.
+
+## Anthropic subscription (experimental, off by default)
+
+`auth = "oauth_opencode"` on the Anthropic provider reuses the Claude subscription token saved by `opencode /connect`
+(read-only, no refresh). **Warning:** Anthropic's terms may prohibit using subscription tokens outside their own
+clients, and this sends a Claude Code system prefix. In testing, small requests passed but OpenCode-sized ones were
+rejected (HTTP 400 "out of extra usage"). Use an API key unless you accept that risk.
 
 ## Tests
 
-`cargo test` (31): policy (tiers, Jev down, degraded provider, fallback chain, stickiness, threshold, anti-flap, force model,
-context too large), Jev client against a real local HTTP server, Anthropic translation (history, tools, SSE), and
-end-to-end router tests against real local HTTP upstreams (fallback on 5xx, 502, streaming + usage, 400 on oversized context).
+`cargo test` runs 32 tests: the policy (every tier, Jev down, degraded provider, fallback chain, stickiness, threshold,
+anti-flap, force model, oversized context), the Jev client against a real local HTTP server, Anthropic translation
+(history, tools, SSE) and end-to-end router tests against real local HTTP upstreams.
 
-## Verified / not verified
+## Status
 
-- Verified with real OpenCode 1.18.33: streaming, tool call round trip, session header `x-session-id`, tool-loop continuation.
-- **Not verified: Jev** (no `TYPESAFE_API_KEY` here): the request/response format follows TypeSafe's docs and is tested
-  against a local fake only. Check the actual REASONING/FRONTIER routing of your two example prompts with your key.
+- Verified with OpenCode 1.18.33: streaming, tool-call round trip, session header `x-session-id`, tool-loop continuation.
+- **Jev is not verified against the live API** (no key during development). Its request format follows TypeSafe's docs
+  and is tested against a local fake. Calibrate `thresholds` with your own key.
 
 ## Known limits
 
-- OAuth is Anthropic-only, experimental, no refresh; no ChatGPT-subscription backend (OpenAI is API key only).
 - Model catalog, prices and context windows are static in `router.toml`; no dynamic discovery, no budget cap.
-- OpenCode's title-generation call shares the session id and is routed like a normal request (it is classified separately).
-- Reasoning/thinking parameters and image parts on OpenAI upstreams are passed through unchanged, not translated.
-- Session state is in memory (lost on restart). Client-disconnect is detected by dropping the upstream stream.
-- Jev sees a truncated dossier (last user message 3000 chars, first 500, tool names); this leaves your machine.
+- OAuth is Anthropic-only, experimental, no refresh. OpenAI is API key only.
+- OpenCode's title-generation call shares the session id and is classified like a normal request.
+- Reasoning/thinking parameters and image parts on OpenAI upstreams are passed through, not translated.
+- Sessions live in memory (lost on restart).
+- Jev receives a truncated dossier (last user message 3000 chars, first 500, tool names): that data leaves your machine.
 - Anthropic `max_tokens` defaults to 8192 when the client sends none.
 
-## TODO (priority order)
+## Roadmap
 
-1. Run with a Jev key, calibrate `thresholds` and weights from `/debug/routes` data.
+1. Calibrate thresholds and weights from real `/debug/routes` data.
 2. Test the Anthropic adapter end to end with OpenCode's tools.
-3. Idle timeout on streams; retry-after handling for 429.
-4. Budget/cost caps in the policy; use measured latency in candidate ordering.
-5. Dynamic model discovery (`/v1/models` of upstreams); OpenRouter; local models health probe.
+3. Stream idle timeout; `Retry-After` handling for 429.
+4. Budget caps; use measured latency in candidate ordering.
+5. Dynamic model discovery, OpenRouter, local model health probes.
 6. Jev extras: MCP tool filtering, subagent suggestion.
-7. Persist sessions; CLI `llm-router routes` to inspect decisions.
+7. Persistent sessions; CLI to inspect decisions.
 
 ## License
 
