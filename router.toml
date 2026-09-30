@@ -1,0 +1,85 @@
+# llm-router configuration. Model names/prices below are examples: adjust to what your accounts expose.
+
+[server]
+listen = "127.0.0.1:8787"
+request_timeout_secs = 60      # connection + response headers (and whole call when not streaming)
+
+[routing]
+default_mode = "auto"          # auto | fast | standard | reasoning | frontier
+stickiness = 0.15              # score distance beyond the current tier band needed to change tier
+switch_threshold = 0.20        # same, but when the change would reverse a recent one (anti-flapping)
+min_confidence = 0.40          # below: keep the current tier, or STANDARD for a new session
+thresholds = [0.30, 0.55, 0.80]  # score boundaries fast|standard|reasoning|frontier
+
+[jev]                          # TypeSafe System One; key read from $TYPESAFE_API_KEY
+api_base = "https://api.typesafe.ai"
+model = "jev-latest"
+timeout_ms = 1500
+
+[storage]
+db_path = "router.db"
+
+# ---- providers -------------------------------------------------------------
+[providers.anthropic]
+kind = "anthropic"
+api_key_env = "ANTHROPIC_API_KEY"
+
+[providers.openai]             # any OpenAI-compatible endpoint works (Mistral, Ollama, OpenRouter...)
+kind = "openai"
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+
+[providers.mistral]
+kind = "openai"
+base_url = "https://api.mistral.ai/v1"
+api_key_env = "MISTRAL_API_KEY"
+
+# ---- model catalog (prices in USD per million tokens) ----------------------
+[models."anthropic/haiku"]
+upstream = "claude-haiku-4-5"
+context_window = 200000
+price_in = 1.0
+price_out = 5.0
+
+[models."anthropic/sonnet"]
+upstream = "claude-sonnet-4-5"
+context_window = 200000
+price_in = 3.0
+price_out = 15.0
+
+[models."anthropic/opus"]
+upstream = "claude-opus-4-5"
+context_window = 200000
+price_in = 5.0
+price_out = 25.0
+
+[models."openai/fast"]
+upstream = "gpt-4.1-mini"
+context_window = 1000000
+price_in = 0.4
+price_out = 1.6
+
+[models."openai/reasoning"]
+upstream = "o3"
+context_window = 200000
+price_in = 2.0
+price_out = 8.0
+
+[models."mistral/cheap"]
+upstream = "mistral-small-latest"
+context_window = 128000
+price_in = 0.1
+price_out = 0.3
+
+# ---- tiers: ordered candidates, first healthy one wins, the rest is fallback ----
+[tiers.fast]
+models = ["anthropic/haiku", "openai/fast", "mistral/cheap"]
+
+[tiers.standard]
+models = ["anthropic/sonnet"]
+
+[tiers.reasoning]
+models = ["openai/reasoning", "anthropic/sonnet"]
+
+[tiers.frontier]
+models = ["anthropic/opus"]
