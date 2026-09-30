@@ -6,6 +6,7 @@ use crate::config::ProviderConfig;
 use futures::StreamExt;
 use serde_json::json;
 
+const OAUTH_SYSTEM_PREFIX: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
 const DEFAULT_MAX_TOKENS: u64 = 8192;
 
 pub struct AnthropicProvider {
@@ -13,6 +14,8 @@ pub struct AnthropicProvider {
     http: reqwest::Client,
     base_url: String,
     api_key_env: String,
+    /// Path of opencode's auth.json when `auth = "oauth_opencode"`.
+    oauth_file: Option<String>,
     timeout: Duration,
 }
 
@@ -23,12 +26,26 @@ impl AnthropicProvider {
             http: reqwest::Client::builder().connect_timeout(Duration::from_secs(10)).build().expect("http client"),
             base_url: pc.base_url.clone().unwrap_or_else(|| "https://api.anthropic.com".into()).trim_end_matches('/').to_string(),
             api_key_env: pc.api_key_env.clone().unwrap_or_else(|| "ANTHROPIC_API_KEY".into()),
+            oauth_file: (pc.auth.as_deref() == Some("oauth_opencode")).then(|| {
+                pc.auth_file.clone().unwrap_or_else(|| format!("{}/.local/share/opencode/auth.json", std::env::var("HOME").unwrap_or_default()))
+            }),
             timeout,
         }
     }
 
     /// Returns the API key or the reason it is unusable.
     fn credential(&self) -> Result<String, String> {
+        if let Some(path) = &self.oauth_file {
+            let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+            let v: Value = serde_json::from_str(&text).map_err(|e| format!("{path}: {e}"))?;
+            let a = &v["anthropic"];
+            let token = a["access"].as_str().ok_or("no anthropic OAuth entry in auth.json")?;
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+            if a["expires"].as_u64().is_some_and(|e| e != 0 && e <= now) {
+                return Err("OAuth token expired; run opencode to refresh it".into());
+            }
+            return Ok(token.to_string());
+        }
         let env = &self.api_key_env;
         std::env::var(env).ok().filter(|k| !k.is_empty()).ok_or(format!("{env} is not set"))
     }
@@ -74,7 +91,7 @@ fn user_blocks(content: &Value) -> Vec<Value> {
     }
 }
 
-pub fn to_anthropic(req: &ChatRequest, upstream: &str) -> Value {
+pub fn to_anthropic(req: &ChatRequest, upstream: &str, oauth: bool) -> Value {
     let mut system: Vec<String> = vec![];
     let mut msgs: Vec<Value> = vec![];
     for m in &req.messages {
@@ -103,7 +120,11 @@ pub fn to_anthropic(req: &ChatRequest, upstream: &str) -> Value {
     let mut body = json!({"model": upstream, "max_tokens": max_tokens, "messages": msgs, "stream": req.stream});
 
     let system_text = system.into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("\n\n");
-    if !system_text.is_empty() {
+    if oauth {
+        let mut blocks = vec![json!({"type": "text", "text": OAUTH_SYSTEM_PREFIX})];
+        blocks.extend(text_block(&system_text));
+        body["system"] = Value::Array(blocks);
+    } else if !system_text.is_empty() {
         body["system"] = Value::String(system_text);
     }
 
@@ -259,9 +280,13 @@ impl LlmProvider for AnthropicProvider {
 
     async fn send_request(&self, model: &ModelSpec, req: &ChatRequest) -> Result<ProviderOutput, ProviderError> {
         let cred = self.credential().map_err(|e| ProviderError::new(Some(401), e))?;
-        let body = to_anthropic(req, &model.upstream);
+        let body = to_anthropic(req, &model.upstream, self.oauth_file.is_some());
         let mut rb = self.http.post(format!("{}/v1/messages", self.base_url)).header("anthropic-version", "2023-06-01").json(&body);
-        rb = rb.header("x-api-key", cred);
+        rb = if self.oauth_file.is_some() {
+            rb.bearer_auth(cred).header("anthropic-beta", "oauth-2025-04-20")
+        } else {
+            rb.header("x-api-key", cred)
+        };
 
         if !req.stream {
             let fut = async {
@@ -334,7 +359,7 @@ mod tests {
             ],
             "tools": [{"type": "function", "function": {"name": "read", "description": "d", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}}]
         }));
-        let b = to_anthropic(&r, "claude-x");
+        let b = to_anthropic(&r, "claude-x", false);
         assert_eq!(b["system"], "be brief");
         assert_eq!(b["max_tokens"], 100);
         assert_eq!(b["tool_choice"], json!({"type": "any"}));
@@ -345,6 +370,14 @@ mod tests {
         assert_eq!(m[2]["content"][0]["type"], "tool_result");
         assert_eq!(m[2]["content"][1]["tool_use_id"], "c2");
         assert_eq!(m[2]["content"][2]["text"], "thanks");
+    }
+
+    #[test]
+    fn oauth_adds_claude_code_system_prefix() {
+        let r = req(json!({"model": "auto", "messages": [{"role": "system", "content": "s"}, {"role": "user", "content": "hi"}]}));
+        let b = to_anthropic(&r, "m", true);
+        assert_eq!(b["system"][0]["text"], OAUTH_SYSTEM_PREFIX);
+        assert_eq!(b["system"][1]["text"], "s");
     }
 
     #[test]

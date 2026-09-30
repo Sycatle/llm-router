@@ -59,6 +59,9 @@ pub struct ProviderConfig {
     pub kind: String,
     pub base_url: Option<String>,
     pub api_key_env: Option<String>,
+    /// anthropic only: "api_key" (default) or "oauth_opencode" (reads opencode's auth.json).
+    pub auth: Option<String>,
+    pub auth_file: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

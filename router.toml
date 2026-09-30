@@ -23,6 +23,9 @@ db_path = "router.db"
 [providers.anthropic]
 kind = "anthropic"
 api_key_env = "ANTHROPIC_API_KEY"
+# Optional, off by default: use the Claude subscription token stored by `opencode /connect`
+# (read-only, no refresh). May violate Anthropic's terms and is rejected for some requests.
+# auth = "oauth_opencode"
 
 [providers.openai]             # any OpenAI-compatible endpoint works (Mistral, Ollama, OpenRouter...)
 kind = "openai"

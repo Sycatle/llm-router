@@ -35,7 +35,10 @@ RUST_LOG=debug cargo run           # also logs the request headers
 ```
 
 Edit `router.toml` first: model ids and prices are examples. Anthropic reads `ANTHROPIC_API_KEY`.
-Providers use API keys only; subscription/OAuth tokens are deliberately unsupported.
+Optional and off by default: `auth = "oauth_opencode"` on the Anthropic provider reuses the Claude subscription
+token saved by `opencode /connect` (read-only, no refresh). **Warning:** Anthropic's terms may prohibit using
+subscription tokens outside their own clients, and it sends a Claude Code system prefix. In testing, small requests
+passed but OpenCode-sized ones were rejected (HTTP 400 "out of extra usage"). Use at your own risk.
 
 ## OpenCode config (`opencode.json`)
 
@@ -102,7 +105,7 @@ end-to-end router tests against real local HTTP upstreams (fallback on 5xx, 502,
 
 ## Known limits
 
-- API keys only (no OAuth/subscription backends).
+- OAuth is Anthropic-only, experimental, no refresh; no ChatGPT-subscription backend (OpenAI is API key only).
 - Model catalog, prices and context windows are static in `router.toml`; no dynamic discovery, no budget cap.
 - OpenCode's title-generation call shares the session id and is routed like a normal request (it is classified separately).
 - Reasoning/thinking parameters and image parts on OpenAI upstreams are passed through unchanged, not translated.
