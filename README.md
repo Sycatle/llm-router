@@ -103,8 +103,13 @@ OpenCode --> POST /v1/chat/completions
   `stickiness` to switch, or by `switch_threshold` if that tier was used in the last 3 requests (no FAST, STANDARD, FAST).
 - **Low confidence** (Jev down or no key): keep the current tier, or STANDARD.
 - **Stickiness.** Within a tier the current model, then the current provider, wins. Tool loops keep model and tier.
-- **Fallback.** Same tier, then higher tiers. Models in cooldown (429/5xx/network/auth, 30-60s, exponential) go last.
-  Only possible before the first streamed byte.
+- **Fallback.** Same tier, then higher tiers. Models in cooldown go last. Only possible before the first streamed byte.
+- **Limits.** Errors are classified, whatever the provider's wording:
+  - rate limit (429/529): that model is skipped for `Retry-After` (default 60s);
+  - quota, credits or usage cap exhausted (402, OpenAI `insufficient_quota`, Anthropic "out of extra usage"):
+    the whole provider is skipped (default 15 min, or `Retry-After`), so the router goes straight to another provider;
+  - 5xx/network/auth: short exponential cooldown; 400/413/422: no cooldown (the request is at fault).
+  Cooldowns are capped at 6h and cleared by the first success.
 
 ### Example log
 
@@ -126,7 +131,7 @@ rejected (HTTP 400 "out of extra usage"). Use an API key unless you accept that 
 
 ## Tests
 
-`cargo test` runs 32 tests: the policy (every tier, Jev down, degraded provider, fallback chain, stickiness, threshold,
+`cargo test` runs 36 tests: the policy (every tier, Jev down, degraded provider, rate-limit and quota handling, fallback chain, stickiness, threshold,
 anti-flap, force model, oversized context), the Jev client against a real local HTTP server, Anthropic translation
 (history, tools, SSE) and end-to-end router tests against real local HTTP upstreams.
 

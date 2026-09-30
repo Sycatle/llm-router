@@ -37,7 +37,7 @@ mod tests {
             "/chat/completions",
             post(move |axum::Json(req): axum::Json<Value>| async move {
                 if status != 200 {
-                    return (StatusCode::from_u16(status).unwrap(), "boom").into_response();
+                    return (StatusCode::from_u16(status).unwrap(), tag).into_response();
                 }
                 if req["stream"] == true {
                     let body = format!(
@@ -144,6 +144,36 @@ mod tests {
         let rec = &svc.metrics.recent(1)[0];
         assert_eq!(rec["fallback_used"], true);
         assert!(svc.tracker.degraded().contains("cheap/m"));
+    }
+
+    #[tokio::test]
+    async fn rate_limited_model_is_skipped_on_next_request() {
+        let (a, b) = (fake_openai(429, "slow down").await, fake_openai(200, "B").await);
+        let svc = RouterService::build(&config(&a, &b), Arc::new(FixedClassifier(Some(trivial())))).unwrap();
+        let app = app(svc.clone());
+        let (_, h, _) = post_chat(&app, chat("auto", false)).await;
+        assert_eq!(h["x-router-model"], "big/m");
+        assert!(svc.tracker.degraded().contains("cheap/m"));
+        let (_, h, _) = post_chat(&app, chat("auto", false)).await;
+        assert_eq!(h["x-router-model"], "big/m");
+        let rec = &svc.metrics.recent(1)[0];
+        assert!(rec["attempts"].as_array().unwrap().is_empty(), "limited model must not be retried");
+    }
+
+    #[tokio::test]
+    async fn quota_exhaustion_disables_the_whole_provider() {
+        let (a, b) = (fake_openai(429, "insufficient_quota").await, fake_openai(200, "B").await);
+        let mut cfg = config(&a, &b);
+        cfg.models.insert("cheap/n".into(), crate::config::ModelConfig { upstream: "n".into(), context_window: 100_000, tools: true, price_in: 0.0, price_out: 0.0 });
+        cfg.tiers.insert("fast".into(), crate::config::TierConfig { models: vec!["cheap/m".into(), "cheap/n".into()] });
+        let svc = RouterService::build(&cfg, Arc::new(FixedClassifier(Some(trivial())))).unwrap();
+        let app = app(svc.clone());
+        let (_, h, _) = post_chat(&app, chat("auto", false)).await;
+        assert_eq!(h["x-router-model"], "big/m");
+        assert!(svc.tracker.degraded().contains("cheap"), "provider-wide cooldown");
+        let (_, h, _) = post_chat(&app, chat("auto", false)).await;
+        assert_eq!(h["x-router-model"], "big/m", "sibling model of the exhausted provider is not tried first");
+        assert!(svc.metrics.recent(1)[0]["attempts"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test]

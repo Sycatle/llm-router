@@ -46,6 +46,12 @@ impl HealthTracker {
         s.cooldown_until = Some(Instant::now() + base * factor);
     }
 
+    /// Skip `key` (a model id, or a provider id for account-wide limits) for `dur`.
+    pub fn cooldown(&self, key: &str, dur: Duration) {
+        let mut g = self.stats.lock().unwrap();
+        g.entry(key.to_string()).or_default().cooldown_until = Some(Instant::now() + dur);
+    }
+
     pub fn degraded(&self) -> HashSet<String> {
         let now = Instant::now();
         self.stats
@@ -141,8 +147,10 @@ mod tests {
         assert!(h.degraded().contains("a/b"));
         h.record_failure("x/y", None);
         assert!(!h.degraded().contains("x/y"));
+        h.cooldown("prov", Duration::from_secs(60));
+        assert!(h.degraded().contains("prov"));
         h.record_success("a/b", Duration::from_millis(100));
-        assert!(h.degraded().is_empty());
+        assert_eq!(h.degraded().len(), 1, "only the provider-wide cooldown remains");
         assert_eq!(h.latency("a/b").unwrap().samples, 1);
     }
 

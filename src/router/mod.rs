@@ -4,7 +4,7 @@ pub mod signals;
 
 use crate::config::Config;
 use crate::metrics::{DecisionRecord, HealthTracker, Metrics};
-use crate::providers::{content_text, ChatRequest, LlmProvider, ProviderError, ProviderHealth, ProviderOutput, Usage, UsageCell};
+use crate::providers::{content_text, Failure, ChatRequest, LlmProvider, ProviderError, ProviderHealth, ProviderOutput, Usage, UsageCell};
 use bytes::Bytes;
 use classifier::{ClassifyInput, RouterClassifier};
 use futures::stream::BoxStream;
@@ -133,6 +133,9 @@ impl RouterService {
     /// Models whose provider is down or in cooldown.
     async fn degraded(&self) -> HashSet<String> {
         let mut set = self.tracker.degraded();
+        // A provider-wide cooldown (quota exhausted) covers all of its models.
+        let limited: Vec<String> = self.policy.catalog().models.values().filter(|m| set.contains(&m.provider)).map(|m| m.id.clone()).collect();
+        set.extend(limited);
         for p in self.providers.values() {
             if let ProviderHealth::Down(_) = p.health().await {
                 set.extend(p.models().iter().map(|m| m.id.clone()));
@@ -241,7 +244,18 @@ impl RouterService {
                 }
                 Err(e) => {
                     tracing::warn!(model = %cand.model, error = %e, "provider attempt failed");
-                    self.tracker.record_failure(&cand.model, e.cooldown());
+                    match e.classify() {
+                        Failure::BadRequest => {}
+                        Failure::Transient => self.tracker.record_failure(&cand.model, Some(Duration::from_secs(30))),
+                        Failure::RateLimited(d) => {
+                            tracing::warn!(model = %cand.model, cooldown_secs = d.as_secs(), "rate limited: model skipped until the window reopens");
+                            self.tracker.cooldown(&cand.model, d);
+                        }
+                        Failure::QuotaExhausted(d) => {
+                            tracing::warn!(provider = %provider.id(), cooldown_secs = d.as_secs(), "quota exhausted: provider skipped");
+                            self.tracker.cooldown(provider.id(), d);
+                        }
+                    }
                     rec.attempts.push(format!("{}: {e}", cand.model));
                     last_err = e.to_string();
                 }

@@ -68,18 +68,49 @@ pub enum ProviderOutput {
 pub struct ProviderError {
     pub status: Option<u16>,
     pub message: String,
+    /// From the `Retry-After` header, when the provider sent one.
+    pub retry_after: Option<Duration>,
 }
+
+/// How a failed attempt must be treated by the router.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Failure {
+    /// The request itself is wrong (400/413/422): no cooldown, other models may still accept it.
+    BadRequest,
+    /// Network error, 5xx, auth: short exponential cooldown on the model.
+    Transient,
+    /// Rate limit (429/529): the model is skipped until the window reopens.
+    RateLimited(Duration),
+    /// Quota / credits / usage cap exhausted: the whole provider is skipped.
+    QuotaExhausted(Duration),
+}
+
+const DEFAULT_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(60);
+const DEFAULT_QUOTA_COOLDOWN: Duration = Duration::from_secs(15 * 60);
+const MAX_COOLDOWN: Duration = Duration::from_secs(6 * 3600);
 
 impl ProviderError {
     pub fn new(status: Option<u16>, message: impl Into<String>) -> Self {
-        Self { status, message: message.into() }
+        Self { status, message: message.into(), retry_after: None }
     }
-    /// Cooldown to apply to the model; None when the error is the request's fault.
-    pub fn cooldown(&self) -> Option<Duration> {
+
+    pub fn classify(&self) -> Failure {
+        let cap = |d: Duration| d.min(MAX_COOLDOWN);
+        let msg = self.message.to_ascii_lowercase();
+        let quota_text = [
+            "insufficient_quota", "exceeded your current quota", "quota exceeded", "out of extra usage",
+            "usage limit", "credit balance", "insufficient credits", "billing_hard_limit",
+        ]
+        .iter()
+        .any(|k| msg.contains(k));
+        let quota_status = matches!(self.status, Some(400 | 402 | 403 | 429));
+        if self.status == Some(402) || (quota_status && quota_text) {
+            return Failure::QuotaExhausted(cap(self.retry_after.unwrap_or(DEFAULT_QUOTA_COOLDOWN)));
+        }
         match self.status {
-            Some(400 | 413 | 422) => None,
-            Some(429) => Some(Duration::from_secs(60)),
-            _ => Some(Duration::from_secs(30)),
+            Some(429 | 529) => Failure::RateLimited(cap(self.retry_after.unwrap_or(DEFAULT_RATE_LIMIT_COOLDOWN))),
+            Some(400 | 413 | 422) => Failure::BadRequest,
+            _ => Failure::Transient,
         }
     }
 }
@@ -153,9 +184,49 @@ pub fn build_providers(cfg: &Config, catalog: &Catalog, tracker: Arc<HealthTrack
     Ok(out)
 }
 
-/// Turns an HTTP error response into a ProviderError (body truncated).
+/// Turns an HTTP error response into a ProviderError (body truncated, Retry-After honoured).
 pub async fn http_error(resp: reqwest::Response) -> ProviderError {
     let status = resp.status().as_u16();
+    let retry_after = resp
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(Duration::from_secs);
     let body = resp.text().await.unwrap_or_default();
-    ProviderError::new(Some(status), crate::router::classifier::truncate(&body, 500))
+    let mut e = ProviderError::new(Some(status), crate::router::classifier::truncate(&body, 500));
+    e.retry_after = retry_after;
+    e
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn err(status: u16, msg: &str) -> ProviderError {
+        ProviderError::new(Some(status), msg)
+    }
+
+    #[test]
+    fn classifies_limits_per_provider_wording() {
+        assert_eq!(err(429, "Rate limit reached").classify(), Failure::RateLimited(Duration::from_secs(60)));
+        assert_eq!(err(529, "overloaded").classify(), Failure::RateLimited(Duration::from_secs(60)));
+        // OpenAI
+        assert!(matches!(err(429, "{\"code\":\"insufficient_quota\"}").classify(), Failure::QuotaExhausted(_)));
+        // Anthropic subscription cap comes as a 400
+        assert!(matches!(err(400, "You're out of extra usage").classify(), Failure::QuotaExhausted(_)));
+        assert!(matches!(err(402, "payment required").classify(), Failure::QuotaExhausted(_)));
+        assert_eq!(err(400, "invalid tool schema").classify(), Failure::BadRequest);
+        assert_eq!(err(503, "down").classify(), Failure::Transient);
+        assert_eq!(ProviderError::new(None, "timeout").classify(), Failure::Transient);
+    }
+
+    #[test]
+    fn retry_after_is_honoured_and_capped() {
+        let mut e = err(429, "slow down");
+        e.retry_after = Some(Duration::from_secs(7));
+        assert_eq!(e.classify(), Failure::RateLimited(Duration::from_secs(7)));
+        e.retry_after = Some(Duration::from_secs(999_999));
+        assert_eq!(e.classify(), Failure::RateLimited(MAX_COOLDOWN));
+    }
 }
