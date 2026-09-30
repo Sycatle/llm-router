@@ -1,7 +1,8 @@
 # llm-router
 
-Local OpenAI-compatible router for OpenCode (or any OpenAI client). One endpoint, several providers:
-a classifier (Jev) emits structured signals, a deterministic policy picks the tier, then the model.
+Local router for OpenCode (or any OpenAI-compatible client). It exposes one OpenAI-compatible endpoint and
+relays to **Anthropic (Claude)**, **OpenAI**, **Mistral** and any OpenAI-compatible server (Ollama, llama.cpp,
+OpenRouter...). A classifier (Jev) emits structured signals, a deterministic policy picks the tier, then the model.
 
 ```
 OpenCode --> POST /v1/chat/completions   (model = auto | auto-fast | auto-standard | auto-reasoning
@@ -19,7 +20,7 @@ OpenCode --> POST /v1/chat/completions   (model = auto | auto-fast | auto-standa
                 |        filters: context window, tools; degraded models last; escalates to higher tiers
                 v
           LlmProvider (trait) --+-- anthropic  (Messages API <-> OpenAI translation, SSE)
-                                +-- openai     (pass-through: OpenAI, Mistral, Ollama, OpenRouter...)
+                                +-- openai     (pass-through: OpenAI, Mistral, Ollama, OpenRouter... any compatible API)
                 v
           metrics: SQLite decisions + in-memory cooldown/latency  -->  GET /debug/routes
 ```
@@ -27,7 +28,7 @@ OpenCode --> POST /v1/chat/completions   (model = auto | auto-fast | auto-standa
 ## Run
 
 ```sh
-export ANTHROPIC_API_KEY=...
+export ANTHROPIC_API_KEY=...       # Claude
 export TYPESAFE_API_KEY=...        # Jev; without it everything is routed to STANDARD
 export OPENAI_API_KEY=... MISTRAL_API_KEY=...   # optional; a provider without credentials is skipped
 cargo run                          # reads ./router.toml (or: cargo run -- path/to/router.toml)
